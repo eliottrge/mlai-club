@@ -1,0 +1,4 @@
+tensorflow
+tf_keras
+opencv-python
+numpy
