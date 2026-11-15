@@ -26,6 +26,42 @@ import time
 from collections import Counter
 from pathlib import Path
 
+REQUIRED_MODULES = ("tensorflow", "tf_keras", "cv2", "numpy")
+
+
+def _relaunch_with_good_python():
+    """If this Python lacks the libraries, re-run the game with one that has them.
+
+    play.bat / play.command install the libraries into a TensorFlow-compatible Python
+    (3.10-3.12), which may not be the `python` your terminal uses.
+    """
+    import importlib.util
+    import shutil
+    import subprocess
+
+    supported = (3, 10) <= sys.version_info[:2] <= (3, 12)  # TensorFlow's supported range
+    if os.environ.get("RPS_RELAUNCHED") or (
+            supported and all(importlib.util.find_spec(m) for m in REQUIRED_MODULES)):
+        return
+    local = os.environ.get("LOCALAPPDATA", "")
+    candidates = [os.path.join(local, "Programs", "Python", f"Python3{v}", "python.exe") for v in (11, 12, 10)]
+    candidates += [shutil.which(n) for n in ("python3.11", "python3.12", "python3.10", "python3", "python")]
+    tried = {os.path.normcase(sys.executable)}
+    for cand in candidates:
+        if not cand or not os.path.isfile(cand) or os.path.normcase(cand) in tried:
+            continue
+        tried.add(os.path.normcase(cand))
+        check = "import " + ", ".join(REQUIRED_MODULES)
+        if subprocess.run([cand, "-c", check], capture_output=True).returncode == 0:
+            print(f"Switching to {cand}, which has the required libraries.")
+            sys.exit(subprocess.call([cand] + sys.argv, env={**os.environ, "RPS_RELAUNCHED": "1"}))
+    sys.exit("Missing libraries for this Python. Double-click play.bat (Windows) or run play.command "
+             "(Mac) once to install them, or run:  python -m pip install -r requirements.txt")
+
+
+if __name__ == "__main__":
+    _relaunch_with_good_python()
+
 import cv2
 import numpy as np
 
