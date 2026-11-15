@@ -16,7 +16,8 @@ import os
 
 # Teachable Machine .h5 files only load reliably with the legacy Keras (tf_keras).
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")  # faster/more reliable MSMF
 
 import argparse
 import random
@@ -95,8 +96,9 @@ def pick_choice(votes, now, end_time):
 # --------------------------------------------------------------------------- #
 def search_dirs():
     home = Path.home()
-    roots = [Path(__file__).resolve().parent, Path.cwd(),
-             home / "Downloads", home / "Desktop", home / "Documents"]
+    roots = [Path(__file__).resolve().parent, Path.cwd()]
+    for base in (home, home / "OneDrive"):  # OneDrive often hosts Desktop/Documents
+        roots += [base / "Downloads", base / "Desktop", base / "Documents"]
     dirs = []
     for root in roots:
         if root.is_dir() and root not in dirs:
@@ -104,18 +106,22 @@ def search_dirs():
     return dirs
 
 
-def find_file(name):
-    """Look for `name` in the usual places (and one folder deep)."""
-    for root in search_dirs():
-        if (root / name).is_file():
-            return root / name
-    for root in search_dirs():
-        try:
-            for sub in sorted(p for p in root.iterdir() if p.is_dir()):
-                if (sub / name).is_file():
-                    return sub / name
-        except OSError:
-            continue
+def find_file(name, max_depth=2):
+    """Look for `name` in the usual places, then up to `max_depth` folders deep."""
+    roots = search_dirs()
+    level = roots
+    for _ in range(max_depth + 1):
+        for folder in level:
+            if (folder / name).is_file():
+                return folder / name
+        nxt = []
+        for folder in level:
+            try:
+                nxt += sorted(p for p in folder.iterdir()
+                              if p.is_dir() and not p.name.startswith((".", "__")))
+            except OSError:
+                continue
+        level = nxt
     return None
 
 
@@ -137,7 +143,11 @@ def locate(explicit, name):
 
 
 def load_model(path):
-    import tf_keras
+    try:
+        import tf_keras
+    except ImportError:
+        sys.exit("A required library is missing. Run play.bat (Windows) / play.command (Mac), "
+                 "or install it with:  python -m pip install -r requirements.txt")
     return tf_keras.models.load_model(str(path), compile=False)
 
 
@@ -155,6 +165,56 @@ def predict(model, class_map, frame):
     probs = model(preprocess(frame), training=False).numpy()[0]
     idx = int(np.argmax(probs))
     return class_map[idx], float(probs[idx])
+
+
+def open_camera(index):
+    """Open the webcam, trying several backends and keeping the first that gives a real picture.
+
+    Some backends open fine but return black/garbage frames, so each one is checked.
+    """
+    try:
+        cv2.setLogLevel(2)  # hide OpenCV's noisy warnings
+    except Exception:
+        pass
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else [cv2.CAP_ANY]
+    indexes = [index] if index is not None else [0, 1, 2, 3]
+    fallback = None
+    for idx in indexes:
+        for backend in backends:
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            kind = "black"
+            for _ in range(40):  # cameras need a moment to warm up
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.std() > 3:
+                    # Infrared (Windows Hello) cameras give a grey picture: all colour channels equal.
+                    b, g, r = (frame[..., i].astype(np.int16) for i in range(3))
+                    colourful = (np.abs(r - g).mean() + np.abs(g - b).mean()) > 1.0
+                    kind = "colour" if colourful else "grey"
+                    break
+                time.sleep(0.05)
+            if kind == "colour":
+                print(f"Using camera {idx}.")
+                if fallback is not None:
+                    fallback[0].release()
+                return cap
+            if kind == "grey" and (fallback is None or fallback[1] == "black"):
+                if fallback is not None:
+                    fallback[0].release()
+                fallback = (cap, kind, idx)
+            elif fallback is None:
+                fallback = (cap, kind, idx)
+            else:
+                cap.release()
+    if fallback is not None:
+        cap, kind, idx = fallback
+        print(f"Warning: camera {idx} only gives a {kind} picture (maybe an infrared camera). "
+              "Try --camera 1 or --camera 2, close other apps using the camera, "
+              "and check Windows camera privacy settings.")
+        return cap
+    sys.exit("Could not open any camera.")
 
 
 # --------------------------------------------------------------------------- #
@@ -182,19 +242,21 @@ def main():
     ap = argparse.ArgumentParser(description="Rock-Paper-Scissors with a Teachable Machine model")
     ap.add_argument("--model", help=f"path to {MODEL_NAME} (default: auto-find)")
     ap.add_argument("--labels", help=f"path to {LABELS_NAME} (default: auto-find)")
-    ap.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
+    ap.add_argument("--camera", type=int, default=None,
+                    help="camera index (default: auto-detect a colour webcam)")
     args = ap.parse_args()
 
     model_path = locate(args.model, MODEL_NAME)
-    labels_path = locate(args.labels, LABELS_NAME)
+    beside_model = model_path.parent / LABELS_NAME  # labels normally sit next to the model
+    if not args.labels and beside_model.is_file():
+        labels_path = beside_model
+    else:
+        labels_path = locate(args.labels, LABELS_NAME)
     print(f"Model:  {model_path}\nLabels: {labels_path}")
     class_map = parse_labels(labels_path.read_text(encoding="utf-8").splitlines())
     model = load_model(model_path)
 
-    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(args.camera, backend)
-    if not cap.isOpened():
-        sys.exit(f"Could not open camera {args.camera}.")
+    cap = open_camera(args.camera)
 
     user_score = cpu_score = 0
     state = "IDLE"
